@@ -11,6 +11,26 @@ import { toNodeHandler } from 'better-auth/node'
 const PORT = process.env.PORT || 5000
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:3000'
 
+// ---------- secrets / origins ----------
+// Locally we only require MONGODB_URI and CLIENT_URL in .env.
+// JWT_SECRET is required on Vercel production so tokens aren't signed with
+// a predictable fallback. Better Auth reuses the same secret.
+const JWT_SECRET = process.env.JWT_SECRET || (process.env.VERCEL
+  ? undefined
+  : 'dev-jwt-secret-change-me-in-production')
+if (!JWT_SECRET) {
+  throw new Error('JWT_SECRET is required in production. Add it in the Vercel dashboard.')
+}
+if (!process.env.JWT_SECRET && !process.env.VERCEL) {
+  console.warn('[warn] Using fallback JWT_SECRET for local development. Set JWT_SECRET in .env for realistic testing.')
+}
+
+// Better Auth's own public URL. On Vercel this is auto-derived from the
+// VERCEL_URL env var, so BETTER_AUTH_URL no longer needs to be set manually.
+const BETTER_AUTH_URL = process.env.VERCEL_URL
+  ? `https://${process.env.VERCEL_URL}`
+  : (process.env.BETTER_AUTH_URL || `http://localhost:${PORT}`)
+
 // ---------- database ----------
 // Vercel runs each request in a serverless function instance that may be
 // reused across invocations. Cache the MongoClient globally so a warm
@@ -58,8 +78,8 @@ const app = express()
 // connect promise once per cold start; warm invocations reuse it.
 const dbForAuth = await getDb()
 const auth = betterAuth({
-  secret: process.env.BETTER_AUTH_SECRET || process.env.JWT_SECRET,
-  baseURL: process.env.BETTER_AUTH_URL || `http://localhost:${PORT}`,
+  secret: process.env.BETTER_AUTH_SECRET || JWT_SECRET,
+  baseURL: BETTER_AUTH_URL,
   trustedOrigins: [CLIENT_URL],
   emailAndPassword: {
     enabled: true,
@@ -108,7 +128,7 @@ function verifyToken(req, res, next) {
   const token = authHeader.split(' ')[1]
   if (!token) return res.status(401).send({ message: 'forbidden access - invalid token' })
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
     if (err) return res.status(401).send({ message: 'forbidden access - invalid token' })
     req.decodedEmail = decoded.email
     next()
@@ -140,7 +160,7 @@ app.post('/jwt', async (req, res) => {
       return res.status(401).send({ message: 'forbidden access - sign in first' })
     }
 
-    const token = jwt.sign({ email: session.user.email }, process.env.JWT_SECRET, { expiresIn: '7d' })
+    const token = jwt.sign({ email: session.user.email }, JWT_SECRET, { expiresIn: '7d' })
     res.send({ token })
   } catch (err) {
     res.status(500).send({ message: err.message })
