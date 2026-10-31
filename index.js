@@ -37,7 +37,7 @@ const BETTER_AUTH_URL = process.env.VERCEL_URL
 // instance reuses the existing connection instead of reconnecting on every
 // request. We never call .connect() at module top-level (that would block
 // cold starts and can race with the function lifecycle).
-const uri = process.env.MONGO_URI
+const uri = process.env.MONGO_URI || process.env.MONGODB_URI
 if (!uri) {
   throw new Error('MONGO_URI is not set')
 }
