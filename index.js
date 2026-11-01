@@ -11,10 +11,7 @@ import { toNodeHandler } from 'better-auth/node'
 const PORT = process.env.PORT || 5000
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:3000'
 
-// ---------- secrets / origins ----------
-// Locally we only require MONGODB_URI and CLIENT_URL in .env.
-// JWT_SECRET is required on Vercel production so tokens aren't signed with
-// a predictable fallback. Better Auth reuses the same secret.
+
 const JWT_SECRET = process.env.JWT_SECRET || (process.env.VERCEL
   ? undefined
   : 'dev-jwt-secret-change-me-in-production')
@@ -25,18 +22,12 @@ if (!process.env.JWT_SECRET && !process.env.VERCEL) {
   console.warn('[warn] Using fallback JWT_SECRET for local development. Set JWT_SECRET in .env for realistic testing.')
 }
 
-// Better Auth's own public URL. On Vercel this is auto-derived from the
-// VERCEL_URL env var, so BETTER_AUTH_URL no longer needs to be set manually.
+
 const BETTER_AUTH_URL = process.env.VERCEL_URL
   ? `https://${process.env.VERCEL_URL}`
   : (process.env.BETTER_AUTH_URL || `http://localhost:${PORT}`)
 
-// ---------- database ----------
-// Vercel runs each request in a serverless function instance that may be
-// reused across invocations. Cache the MongoClient globally so a warm
-// instance reuses the existing connection instead of reconnecting on every
-// request. We never call .connect() at module top-level (that would block
-// cold starts and can race with the function lifecycle).
+
 const uri = process.env.MONGO_URI || process.env.MONGODB_URI
 if (!uri) {
   throw new Error('MONGO_URI is not set')
@@ -50,8 +41,7 @@ if (!cachedClient) {
   globalForMongo.__mongoClient = { client }
 }
 
-// Lazily connect on first request. Returns the ``borrowbook`` db handle.
-// The same promise is reused across concurrent cold-start requests.
+
 let dbPromise
 function getDb() {
   if (!dbPromise) {
@@ -63,19 +53,9 @@ function getDb() {
   return dbPromise
 }
 
-// ---------- app ----------
+
 const app = express()
 
-// ---------- authentication (Better Auth) ----------
-// Sign-up / sign-in / sign-out / session are handled by Better Auth, which
-// stores users, sessions, and (scrypt-hashed) passwords in this MongoDB.
-// The handler is mounted at /api/auth/*; the Next.js client reaches it
-// through the same-origin /api/server proxy in next.config.ts, so the
-// session cookie it sets is first-party for the browser.
-//
-// mongodbAdapter takes a live `Db` instance, so we must resolve the
-// connection before constructing Better Auth. This awaits the (cached)
-// connect promise once per cold start; warm invocations reuse it.
 const dbForAuth = await getDb()
 const auth = betterAuth({
   secret: process.env.BETTER_AUTH_SECRET || JWT_SECRET,
@@ -83,33 +63,25 @@ const auth = betterAuth({
   trustedOrigins: [CLIENT_URL],
   emailAndPassword: {
     enabled: true,
-    // Matches the register form's live checklist (6+ chars).
-    // NOTE: minPasswordLength/maxPasswordLength sit directly on
-    // emailAndPassword, not nested under a `password` key — Better Auth
-    // reads `emailAndPassword.minPasswordLength` (defaults to 8 otherwise).
     minPasswordLength: 6,
     maxPasswordLength: 128,
   },
   database: mongodbAdapter(dbForAuth, { client }),
 })
 
-// ---------- middleware ----------
-// CORS only matters when the browser bypasses the Next.js proxy and hits
-// this server directly; through the proxy all requests are same-origin.
+
 app.use(cors({
   origin: [CLIENT_URL, 'http://localhost:3000'],
   credentials: true,
 }))
 
-// Better Auth must be mounted BEFORE express.json(): its handler reads the
-// raw request body itself, which express.json() would consume first.
+
 app.use('/api/auth', toNodeHandler(auth))
 
 app.use(express.json())
 app.use(cookieParser())
 
-// Resolve the collections lazily so route handlers always run after the
-// connection is established.
+
 async function booksCollection() {
   const db = await getDb()
   return db.collection('books')
@@ -119,8 +91,7 @@ async function borrowsCollection() {
   return db.collection('borrows')
 }
 
-// ---------- token check helpers ----------
-// Verifies the JWT sent as: Authorization: Bearer <token>
+
 function verifyToken(req, res, next) {
   const authHeader = req.headers.authorization
   if (!authHeader) return res.status(401).send({ message: 'forbidden access - no token provided' })
@@ -135,7 +106,6 @@ function verifyToken(req, res, next) {
   })
 }
 
-// Ensures the requested email matches the token's email (for query-based routes)
 async function verifyTokenAndEmail(req, res, next) {
   if (req.query.email !== req.decodedEmail) {
     return res.status(403).send({ message: 'forbidden access' })
@@ -143,16 +113,11 @@ async function verifyTokenAndEmail(req, res, next) {
   next()
 }
 
-// Checks that a string is a valid MongoDB ObjectId
 function isValidId(id) {
   return ObjectId.isValid(id)
 }
 
-// ---------- API routes ----------
 
-// Issue a JWT for a *logged-in* user. The client calls this after Better Auth
-// sign-in/sign-up; the Better Auth session cookie that arrives with the
-// request is what authenticates it — the email is never trusted from the body.
 app.post('/jwt', async (req, res) => {
   try {
     const session = await auth.api.getSession({ headers: req.headers })
@@ -167,7 +132,6 @@ app.post('/jwt', async (req, res) => {
   }
 })
 
-// GET /books — get all books (public)
 app.get('/books', async (req, res) => {
   try {
     const books = await booksCollection()
@@ -178,7 +142,6 @@ app.get('/books', async (req, res) => {
   }
 })
 
-// GET /books/:id — get one book (public)
 app.get('/books/:id', async (req, res) => {
   try {
     const { id } = req.params
@@ -194,12 +157,10 @@ app.get('/books/:id', async (req, res) => {
   }
 })
 
-// POST /books — add a book (private)
 app.post('/books', verifyToken, async (req, res) => {
   try {
     const bookData = req.body
 
-    // only allow known fields
     const book = {
       title: bookData.title,
       author: bookData.author,
@@ -215,7 +176,7 @@ app.post('/books', verifyToken, async (req, res) => {
       return res.status(400).send({ message: 'missing required book fields' })
     }
 
-    // The token identifies the user — never trust the body's email instead.
+  
     if (book.userEmail && book.userEmail !== req.decodedEmail) {
       return res.status(403).send({ message: 'forbidden access' })
     }
@@ -229,7 +190,6 @@ app.post('/books', verifyToken, async (req, res) => {
   }
 })
 
-// PATCH /books/:id — update a book (private)
 app.patch('/books/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params
@@ -257,7 +217,6 @@ app.patch('/books/:id', verifyToken, async (req, res) => {
   }
 })
 
-// DELETE /books/:id — delete a book (private)
 app.delete('/books/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params
@@ -280,7 +239,6 @@ app.delete('/books/:id', verifyToken, async (req, res) => {
   }
 })
 
-// POST /borrows — borrow a book (private)
 app.post('/borrows', verifyToken, async (req, res) => {
   try {
     const borrowData = req.body
@@ -311,7 +269,6 @@ app.post('/borrows', verifyToken, async (req, res) => {
   }
 })
 
-// GET /borrows?email=user@email.com — get borrows of the logged in user (private)
 app.get('/borrows', verifyToken, verifyTokenAndEmail, async (req, res) => {
   try {
     const { email } = req.query
@@ -326,7 +283,6 @@ app.get('/borrows', verifyToken, verifyTokenAndEmail, async (req, res) => {
   }
 })
 
-// DELETE /borrows/:id — return a book (private)
 app.delete('/borrows/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params
@@ -336,7 +292,6 @@ app.delete('/borrows/:id', verifyToken, async (req, res) => {
     const borrow = await borrows.findOne({ _id: new ObjectId(id) })
     if (!borrow) return res.status(404).send({ message: 'borrow not found' })
 
-    // only the borrower can return their own book
     if (borrow.userEmail !== req.decodedEmail) {
       return res.status(403).send({ message: 'forbidden access' })
     }
@@ -348,25 +303,17 @@ app.delete('/borrows/:id', verifyToken, async (req, res) => {
   }
 })
 
-// root
 app.get('/', (req, res) => {
   res.send('BookNook server is running!')
 })
 
-// global error handler
 app.use((err, req, res, next) => {
   res.status(500).send({ message: err.message })
 })
 
-// ---------- serverless export ----------
-// On Vercel, the function runtime imports this module and calls the default
-// export for every request. Locally (`npm run dev`), we start a normal
-// long-lived server instead.
+
 if (process.env.VERCEL) {
-  // Vercel sets VERCEL=1; export the Express app as the handler.
-  // Better Auth's adapter already awaited the db connection above, so by
-  // the time a request arrives the connection is warm (or warming via the
-  // shared promise).
+ 
 } else {
   app.listen(PORT, () => {
     console.log(`server is running at ${PORT}`)
