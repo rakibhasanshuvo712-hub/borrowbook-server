@@ -181,6 +181,9 @@ app.post('/books', verifyToken, async (req, res) => {
       category: bookData.category,
       image: bookData.image,
       description: bookData.description,
+      bookNumber: bookData.bookNumber,
+      totalCopies: bookData.totalCopies,
+      availableCopies: bookData.totalCopies,
       userName: bookData.userName,
       userEmail: bookData.userEmail,
       addedAt: bookData.addedAt || new Date().toISOString(),
@@ -188,6 +191,9 @@ app.post('/books', verifyToken, async (req, res) => {
 
     if (!book.title || !book.author || !book.category || !book.image || !book.description) {
       return res.status(400).send({ message: 'missing required book fields' })
+    }
+    if (!Number.isInteger(book.totalCopies) || book.totalCopies <= 0) {
+      return res.status(400).send({ message: 'totalCopies must be a positive integer' })
     }
 
   
@@ -212,13 +218,34 @@ app.patch('/books/:id', verifyToken, async (req, res) => {
     const books = await booksCollection()
     const existing = await books.findOne({ _id: new ObjectId(id) })
     if (!existing) return res.status(404).send({ message: 'book not found' })
-    if (existing.userEmail !== req.decodedEmail) {
-      return res.status(403).send({ message: 'forbidden access' })
-    }
 
     const updatedData = { ...req.body }
     delete updatedData._id
     delete updatedData.userEmail
+    delete updatedData.availableCopies
+
+    const existingTotal = Number.isInteger(existing.totalCopies) && existing.totalCopies > 0
+      ? existing.totalCopies
+      : 1
+    const existingAvailable = Number.isInteger(existing.availableCopies) && existing.availableCopies >= 0
+      ? existing.availableCopies
+      : 1
+    const checkedOut = Math.max(0, existingTotal - existingAvailable)
+
+    if (Object.hasOwn(updatedData, 'totalCopies')) {
+      if (!Number.isInteger(updatedData.totalCopies) || updatedData.totalCopies <= 0) {
+        return res.status(400).send({ message: 'totalCopies must be a positive integer' })
+      }
+      if (updatedData.totalCopies < checkedOut) {
+        return res.status(409).send({ message: 'totalCopies cannot be lower than copies currently checked out' })
+      }
+      updatedData.availableCopies = updatedData.totalCopies - checkedOut
+    } else {
+      if (!Number.isInteger(existing.totalCopies) || !Number.isInteger(existing.availableCopies)) {
+        updatedData.totalCopies = existingTotal
+        updatedData.availableCopies = existingAvailable
+      }
+    }
 
     const result = await books.updateOne(
       { _id: new ObjectId(id) },
@@ -237,11 +264,6 @@ app.delete('/books/:id', verifyToken, async (req, res) => {
     if (!isValidId(id)) return res.status(404).send({ message: 'book not found' })
 
     const books = await booksCollection()
-    const existing = await books.findOne({ _id: new ObjectId(id) })
-    if (existing && existing.userEmail !== req.decodedEmail) {
-      return res.status(403).send({ message: 'forbidden access' })
-    }
-
     const result = await books.deleteOne({ _id: new ObjectId(id) })
 
     if (result.deletedCount === 0) {
@@ -290,9 +312,71 @@ app.post('/borrows', verifyToken, async (req, res) => {
     if (borrow.userEmail !== req.decodedEmail) {
       return res.status(403).send({ message: 'forbidden access' })
     }
+    if (!isValidId(borrow.bookId)) {
+      return res.status(400).send({ message: 'invalid bookId' })
+    }
 
     const borrows = await borrowsCollection()
-    const result = await borrows.insertOne(borrow)
+    const books = await booksCollection()
+    const session = client.startSession()
+    let outcome = 'created'
+    let result
+    try {
+      await session.withTransaction(async () => {
+        const activeBorrow = await borrows.findOne({
+          bookId: borrow.bookId,
+          userEmail: req.decodedEmail,
+        }, { session })
+        if (activeBorrow) {
+          outcome = 'duplicate'
+          return
+        }
+
+        const bookObjectId = new ObjectId(borrow.bookId)
+        const book = await books.findOne({ _id: bookObjectId }, { session })
+        if (!book) {
+          outcome = 'missing-book'
+          return
+        }
+
+        const stockUpdate = await books.updateOne(
+          {
+            _id: bookObjectId,
+            $or: [
+              { availableCopies: { $gt: 0 } },
+              { availableCopies: { $exists: false } },
+            ],
+          },
+          [{
+            $set: {
+              totalCopies: { $ifNull: ['$totalCopies', 1] },
+              availableCopies: {
+                $subtract: [{ $ifNull: ['$availableCopies', 1] }, 1],
+              },
+            },
+          }],
+          { session }
+        )
+        if (stockUpdate.modifiedCount === 0) {
+          outcome = 'unavailable'
+          return
+        }
+
+        result = await borrows.insertOne(borrow, { session })
+      })
+    } finally {
+      await session.endSession()
+    }
+
+    if (outcome === 'duplicate') {
+      return res.status(409).send({ message: 'book already borrowed by this user' })
+    }
+    if (outcome === 'missing-book') {
+      return res.status(404).send({ message: 'book not found' })
+    }
+    if (outcome === 'unavailable') {
+      return res.status(409).send({ message: 'no copies available' })
+    }
     res.status(201).send(result)
   } catch (err) {
     res.status(500).send({ message: err.message })
@@ -319,14 +403,54 @@ app.delete('/borrows/:id', verifyToken, async (req, res) => {
     if (!isValidId(id)) return res.status(404).send({ message: 'borrow not found' })
 
     const borrows = await borrowsCollection()
-    const borrow = await borrows.findOne({ _id: new ObjectId(id) })
-    if (!borrow) return res.status(404).send({ message: 'borrow not found' })
+    const books = await booksCollection()
+    const session = client.startSession()
+    let outcome = 'returned'
+    let result
+    try {
+      await session.withTransaction(async () => {
+        const borrowId = new ObjectId(id)
+        const borrow = await borrows.findOne({
+          _id: borrowId,
+          userEmail: req.decodedEmail,
+        }, { session })
+        if (!borrow) {
+          outcome = 'missing'
+          return
+        }
 
-    if (borrow.userEmail !== req.decodedEmail) {
-      return res.status(403).send({ message: 'forbidden access' })
+        result = await borrows.deleteOne({
+          _id: borrowId,
+          userEmail: req.decodedEmail,
+        }, { session })
+        if (result.deletedCount === 0) {
+          outcome = 'missing'
+          return
+        }
+
+        if (isValidId(borrow.bookId)) {
+          await books.updateOne(
+            { _id: new ObjectId(borrow.bookId) },
+            [{
+              $set: {
+                totalCopies: { $ifNull: ['$totalCopies', 1] },
+                availableCopies: {
+                  $min: [
+                    { $add: [{ $ifNull: ['$availableCopies', 1] }, 1] },
+                    { $ifNull: ['$totalCopies', 1] },
+                  ],
+                },
+              },
+            }],
+            { session }
+          )
+        }
+      })
+    } finally {
+      await session.endSession()
     }
 
-    const result = await borrows.deleteOne({ _id: new ObjectId(id) })
+    if (outcome === 'missing') return res.status(404).send({ message: 'borrow not found' })
     res.send(result)
   } catch (err) {
     res.status(500).send({ message: err.message })
