@@ -106,6 +106,20 @@ function verifyToken(req, res, next) {
   })
 }
 
+const adminEmails = new Set(
+  (process.env.ADMIN_EMAILS || '')
+    .split(',')
+    .map(email => email.trim().toLowerCase())
+    .filter(Boolean)
+)
+
+function verifyAdmin(req, res, next) {
+  if (!adminEmails.has(String(req.decodedEmail || '').trim().toLowerCase())) {
+    return res.status(403).send({ message: 'forbidden access' })
+  }
+  next()
+}
+
 async function verifyTokenAndEmail(req, res, next) {
   if (req.query.email !== req.decodedEmail) {
     return res.status(403).send({ message: 'forbidden access' })
@@ -230,6 +244,22 @@ app.delete('/books/:id', verifyToken, async (req, res) => {
 
     const result = await books.deleteOne({ _id: new ObjectId(id) })
 
+    if (result.deletedCount === 0) {
+      return res.status(404).send({ message: 'book not found' })
+    }
+    res.send(result)
+  } catch (err) {
+    res.status(500).send({ message: err.message })
+  }
+})
+
+app.delete('/admin/books/:id', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params
+    if (!isValidId(id)) return res.status(404).send({ message: 'book not found' })
+
+    const books = await booksCollection()
+    const result = await books.deleteOne({ _id: new ObjectId(id) })
     if (result.deletedCount === 0) {
       return res.status(404).send({ message: 'book not found' })
     }
