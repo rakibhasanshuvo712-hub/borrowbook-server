@@ -192,11 +192,9 @@ app.post('/books', verifyToken, async (req, res) => {
     if (!book.title || !book.author || !book.category || !book.image || !book.description) {
       return res.status(400).send({ message: 'missing required book fields' })
     }
-    if (!Number.isInteger(book.totalCopies) || book.totalCopies <= 0) {
+    if (!Number.isInteger(book.totalCopies) || book.totalCopies < 1) {
       return res.status(400).send({ message: 'totalCopies must be a positive integer' })
     }
-
-  
     if (book.userEmail && book.userEmail !== req.decodedEmail) {
       return res.status(403).send({ message: 'forbidden access' })
     }
@@ -218,6 +216,9 @@ app.patch('/books/:id', verifyToken, async (req, res) => {
     const books = await booksCollection()
     const existing = await books.findOne({ _id: new ObjectId(id) })
     if (!existing) return res.status(404).send({ message: 'book not found' })
+    if (String(existing.userEmail || '').trim().toLowerCase() !== String(req.decodedEmail || '').trim().toLowerCase()) {
+      return res.status(403).send({ message: 'only the book owner can update this book' })
+    }
 
     const updatedData = { ...req.body }
     delete updatedData._id
@@ -264,11 +265,13 @@ app.delete('/books/:id', verifyToken, async (req, res) => {
     if (!isValidId(id)) return res.status(404).send({ message: 'book not found' })
 
     const books = await booksCollection()
-    const result = await books.deleteOne({ _id: new ObjectId(id) })
-
-    if (result.deletedCount === 0) {
-      return res.status(404).send({ message: 'book not found' })
+    const existing = await books.findOne({ _id: new ObjectId(id) })
+    if (!existing) return res.status(404).send({ message: 'book not found' })
+    if (String(existing.userEmail || '').trim().toLowerCase() !== String(req.decodedEmail || '').trim().toLowerCase()) {
+      return res.status(403).send({ message: 'only the book owner can delete this book' })
     }
+    const result = await books.deleteOne({ _id: new ObjectId(id), userEmail: existing.userEmail })
+    if (result.deletedCount === 0) return res.status(404).send({ message: 'book not found' })
     res.send(result)
   } catch (err) {
     res.status(500).send({ message: err.message })
@@ -281,10 +284,13 @@ app.delete('/admin/books/:id', verifyToken, verifyAdmin, async (req, res) => {
     if (!isValidId(id)) return res.status(404).send({ message: 'book not found' })
 
     const books = await booksCollection()
-    const result = await books.deleteOne({ _id: new ObjectId(id) })
-    if (result.deletedCount === 0) {
-      return res.status(404).send({ message: 'book not found' })
+    const existing = await books.findOne({ _id: new ObjectId(id) })
+    if (!existing) return res.status(404).send({ message: 'book not found' })
+    if (String(existing.userEmail || '').trim().toLowerCase() !== String(req.decodedEmail || '').trim().toLowerCase()) {
+      return res.status(403).send({ message: 'only the book owner can delete this book' })
     }
+    const result = await books.deleteOne({ _id: new ObjectId(id), userEmail: existing.userEmail })
+    if (result.deletedCount === 0) return res.status(404).send({ message: 'book not found' })
     res.send(result)
   } catch (err) {
     res.status(500).send({ message: err.message })
@@ -301,11 +307,11 @@ app.post('/borrows', verifyToken, async (req, res) => {
       bookImage: borrowData.bookImage,
       userName: borrowData.userName,
       userEmail: borrowData.userEmail,
-      borrowDate: borrowData.borrowDate,
-      returnDate: borrowData.returnDate,
+      borrowDate: borrowData.borrowDate || new Date().toISOString(),
+      returnDate: borrowData.returnDate || new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
     }
 
-    if (!borrow.bookId || !borrow.bookTitle || !borrow.userEmail || !borrow.borrowDate) {
+    if (!borrow.bookId || !borrow.bookTitle || !borrow.userEmail) {
       return res.status(400).send({ message: 'missing required borrow fields' })
     }
 
@@ -339,22 +345,25 @@ app.post('/borrows', verifyToken, async (req, res) => {
           return
         }
 
+        // Older records may not have stock fields yet; initialize them before
+        // applying the guarded atomic decrement.
+        if (!Number.isInteger(book.totalCopies) || !Number.isInteger(book.availableCopies)) {
+          const initialAvailable = Number.isInteger(book.availableCopies) && book.availableCopies >= 0
+            ? book.availableCopies
+            : 1
+          const initialTotal = Number.isInteger(book.totalCopies) && book.totalCopies > 0
+            ? book.totalCopies
+            : Math.max(initialAvailable, 1)
+          await books.updateOne(
+            { _id: bookObjectId },
+            { $set: { totalCopies: initialTotal, availableCopies: initialAvailable } },
+            { session }
+          )
+        }
+
         const stockUpdate = await books.updateOne(
-          {
-            _id: bookObjectId,
-            $or: [
-              { availableCopies: { $gt: 0 } },
-              { availableCopies: { $exists: false } },
-            ],
-          },
-          [{
-            $set: {
-              totalCopies: { $ifNull: ['$totalCopies', 1] },
-              availableCopies: {
-                $subtract: [{ $ifNull: ['$availableCopies', 1] }, 1],
-              },
-            },
-          }],
+          { _id: bookObjectId, availableCopies: { $gt: 0 } },
+          { $inc: { availableCopies: -1 } },
           { session }
         )
         if (stockUpdate.modifiedCount === 0) {
@@ -429,19 +438,15 @@ app.delete('/borrows/:id', verifyToken, async (req, res) => {
         }
 
         if (isValidId(borrow.bookId)) {
+          const bookId = new ObjectId(borrow.bookId)
           await books.updateOne(
-            { _id: new ObjectId(borrow.bookId) },
-            [{
-              $set: {
-                totalCopies: { $ifNull: ['$totalCopies', 1] },
-                availableCopies: {
-                  $min: [
-                    { $add: [{ $ifNull: ['$availableCopies', 1] }, 1] },
-                    { $ifNull: ['$totalCopies', 1] },
-                  ],
-                },
-              },
-            }],
+            { _id: bookId, totalCopies: { $exists: false } },
+            { $set: { totalCopies: 1 } },
+            { session }
+          )
+          await books.updateOne(
+            { _id: bookId },
+            { $inc: { availableCopies: 1 } },
             { session }
           )
         }
